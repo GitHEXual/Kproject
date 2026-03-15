@@ -4,21 +4,24 @@ import (
 	"context"
 	"encoding/base32"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	circuitv2client "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
 type Node struct {
-	Host    host.Host
-	ShortID string
-	Ctx     context.Context
-	Cancel  context.CancelFunc
+	Host       host.Host
+	ShortID    string
+	ServerInfo *peer.AddrInfo
+	Ctx        context.Context
+	Cancel     context.CancelFunc
 }
 
 func shortIDFromPeerID(pid peer.ID) string {
@@ -71,11 +74,24 @@ func NewClientNode(ctx context.Context, serverAddr string) (*Node, error) {
 		return nil, fmt.Errorf("failed to connect to server: %w", err)
 	}
 
+	// Proactively reserve a relay slot on the server so other peers
+	// can reach us through the relay immediately (don't wait for AutoNAT).
+	reserveCtx, reserveCancel := context.WithTimeout(ctx, 15*time.Second)
+	rsvp, err := circuitv2client.Reserve(reserveCtx, h, *serverInfo)
+	reserveCancel()
+	if err != nil {
+		log.Printf("relay reservation failed (non-fatal): %v", err)
+	} else {
+		log.Printf("relay reservation OK, got %d relay addrs, expires %s",
+			len(rsvp.Addrs), rsvp.Expiration.Format(time.RFC3339))
+	}
+
 	return &Node{
-		Host:    h,
-		ShortID: shortIDFromPeerID(h.ID()),
-		Ctx:     ctx,
-		Cancel:  cancel,
+		Host:       h,
+		ShortID:    shortIDFromPeerID(h.ID()),
+		ServerInfo: serverInfo,
+		Ctx:        ctx,
+		Cancel:     cancel,
 	}, nil
 }
 

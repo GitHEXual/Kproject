@@ -70,7 +70,7 @@ func handleStream(s network.Stream, store *Store, h host.Host) {
 		case "REGISTER":
 			handleRegister(s, store, h, &req, writer)
 		case "LOOKUP":
-			handleLookup(store, &req, writer)
+			handleLookup(store, h, &req, writer)
 		case "UNREGISTER":
 			store.Unregister(s.Conn().RemotePeer())
 			writeResponse(writer, Response{OK: true})
@@ -105,16 +105,32 @@ func handleRegister(s network.Stream, store *Store, h host.Host, req *Request, w
 	writeResponse(w, Response{OK: true})
 }
 
-func handleLookup(store *Store, req *Request, w *bufio.Writer) {
+func handleLookup(store *Store, h host.Host, req *Request, w *bufio.Writer) {
 	rec, ok := store.LookupByShortID(req.ShortID)
 	if !ok {
 		writeResponse(w, Response{OK: false, Error: "peer not found"})
 		return
 	}
 
+	addrSet := make(map[string]bool)
 	var addrStrs []string
 	for _, a := range rec.Addrs {
-		addrStrs = append(addrStrs, a.String())
+		s := a.String()
+		if !addrSet[s] {
+			addrSet[s] = true
+			addrStrs = append(addrStrs, s)
+		}
+	}
+
+	// Inject relay circuit addresses through this server so the
+	// requesting peer can reach the target even if both are behind NAT.
+	for _, serverAddr := range h.Addrs() {
+		relayAddr := fmt.Sprintf("%s/p2p/%s/p2p-circuit/p2p/%s",
+			serverAddr, h.ID(), rec.PeerID)
+		if !addrSet[relayAddr] {
+			addrSet[relayAddr] = true
+			addrStrs = append(addrStrs, relayAddr)
+		}
 	}
 
 	writeResponse(w, Response{
