@@ -55,9 +55,7 @@ func NewClientNode(ctx context.Context, serverAddr string) (*Node, error) {
 			"/ip4/0.0.0.0/udp/0/quic-v1",
 			"/ip4/0.0.0.0/tcp/0",
 		),
-		libp2p.NATPortMap(),
 		libp2p.EnableRelay(),
-		libp2p.EnableHolePunching(),
 		libp2p.EnableAutoRelayWithStaticRelays([]peer.AddrInfo{*serverInfo}),
 	)
 	if err != nil {
@@ -109,7 +107,7 @@ func NewServerNode(ctx context.Context, listenPort int) (*Node, error) {
 		return nil, fmt.Errorf("failed to create server host: %w", err)
 	}
 
-	if _, err := relay.New(h); err != nil {
+	if _, err := relay.New(h, relay.WithInfiniteLimits()); err != nil {
 		h.Close()
 		cancel()
 		return nil, fmt.Errorf("failed to start relay service: %w", err)

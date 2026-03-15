@@ -15,7 +15,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
-	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -110,111 +109,41 @@ func (s *Service) readLoop(stream network.Stream, remotePeer peer.ID) {
 	}
 }
 
-func (s *Service) clearBackoff(pid peer.ID) {
-	if sw, ok := s.host.Network().(*swarm.Swarm); ok {
-		sw.Backoff().Clear(pid)
-	}
-}
-
 func (s *Service) ConnectToPeer(ctx context.Context, info *peer.AddrInfo, statusCh chan<- ConnectStatus) error {
 	defer close(statusCh)
 
-	// Separate direct and relay addresses from the lookup result.
-	var directAddrs, relayAddrs []ma.Multiaddr
+	// Filter to relay addresses only
+	var relayAddrs []ma.Multiaddr
 	for _, addr := range info.Addrs {
-		isRelay := false
 		for _, p := range addr.Protocols() {
 			if p.Code == ma.P_CIRCUIT {
-				isRelay = true
+				relayAddrs = append(relayAddrs, addr)
 				break
 			}
 		}
-		if isRelay {
-			relayAddrs = append(relayAddrs, addr)
-		} else {
-			directAddrs = append(directAddrs, addr)
-		}
 	}
 
-	// Step 1: Try direct addresses only
-	var err error
-	if len(directAddrs) > 0 {
-		statusCh <- ConnectStatus{Step: 1, Message: "Прямое подключение..."}
-		s.host.Peerstore().AddAddrs(info.ID, directAddrs, time.Hour)
-		directInfo := peer.AddrInfo{ID: info.ID, Addrs: directAddrs}
-		directCtx, directCancel := context.WithTimeout(ctx, 8*time.Second)
-		err = s.host.Connect(directCtx, directInfo)
-		directCancel()
-	} else {
-		err = fmt.Errorf("no direct addresses")
+	allRelayAddrs := append(relayAddrs, s.buildRelayAddrs(info.ID)...)
+	if len(allRelayAddrs) == 0 {
+		statusCh <- ConnectStatus{Done: true, Error: fmt.Errorf("no relay addresses")}
+		return fmt.Errorf("no relay addresses for peer")
 	}
 
-	// Step 2: NAT port mapping + retry direct
+	statusCh <- ConnectStatus{Step: 1, Message: "Подключение через relay..."}
+	s.host.Peerstore().AddAddrs(info.ID, allRelayAddrs, time.Hour)
+	relayInfo := peer.AddrInfo{ID: info.ID, Addrs: allRelayAddrs}
+	relayCtx, relayCancel := context.WithTimeout(ctx, 15*time.Second)
+	err := s.host.Connect(relayCtx, relayInfo)
+	relayCancel()
 	if err != nil {
-		s.clearBackoff(info.ID)
-		statusCh <- ConnectStatus{Step: 2, Message: "NAT port mapping (UPnP/NAT-PMP)..."}
-		time.Sleep(3 * time.Second)
-
-		if len(directAddrs) > 0 {
-			directInfo := peer.AddrInfo{ID: info.ID, Addrs: directAddrs}
-			retryCtx, retryCancel := context.WithTimeout(ctx, 8*time.Second)
-			err = s.host.Connect(retryCtx, directInfo)
-			retryCancel()
-		}
+		statusCh <- ConnectStatus{Step: 1, Message: "Не удалось подключиться", Done: true, Error: err}
+		return fmt.Errorf("relay connect failed: %w", err)
 	}
 
-	// Step 3: Connect via relay (enables hole punching coordination via DCUtR)
-	if err != nil {
-		s.clearBackoff(info.ID)
-		statusCh <- ConnectStatus{Step: 3, Message: "Подключение через relay..."}
-
-		allRelayAddrs := append(relayAddrs, s.buildRelayAddrs(info.ID)...)
-		s.host.Peerstore().AddAddrs(info.ID, allRelayAddrs, time.Hour)
-		if len(allRelayAddrs) > 0 {
-			relayInfo := peer.AddrInfo{ID: info.ID, Addrs: allRelayAddrs}
-			relayCtx, relayCancel := context.WithTimeout(ctx, 15*time.Second)
-			err = s.host.Connect(relayCtx, relayInfo)
-			relayCancel()
-		}
-	}
-
-	// Step 4: If relay connected, wait for hole punch to upgrade to direct
-	if err == nil && !s.hasDirectConn(info.ID) {
-		statusCh <- ConnectStatus{Step: 4, Message: "Hole punching (DCUtR)..."}
-		time.Sleep(5 * time.Second)
-		if s.hasDirectConn(info.ID) {
-			log.Printf("hole punch succeeded, upgraded to direct connection")
-		}
-	}
-
-	// Step 5: Final fallback — retry everything with clean backoff
-	if err != nil {
-		s.clearBackoff(info.ID)
-		statusCh <- ConnectStatus{Step: 5, Message: "Финальная попытка (все адреса)..."}
-
-		allAddrs := append(directAddrs, relayAddrs...)
-		allAddrs = append(allAddrs, s.buildRelayAddrs(info.ID)...)
-		s.host.Peerstore().AddAddrs(info.ID, allAddrs, time.Hour)
-		if len(allAddrs) > 0 {
-			finalInfo := peer.AddrInfo{ID: info.ID, Addrs: allAddrs}
-			finalCtx, finalCancel := context.WithTimeout(ctx, 20*time.Second)
-			err = s.host.Connect(finalCtx, finalInfo)
-			finalCancel()
-		}
-
-		if err != nil {
-			statusCh <- ConnectStatus{Step: 5, Message: "Не удалось подключиться", Done: true, Error: err}
-			return fmt.Errorf("all connection attempts failed: %w", err)
-		}
-	}
-
-	// Open chat stream
-	connType := s.connectionType(info.ID)
-	statusCh <- ConnectStatus{Step: 6, Message: fmt.Sprintf("Открытие чат-канала (%s)...", connType)}
+	// Open chat stream (relay connections require WithAllowLimitedConn)
+	statusCh <- ConnectStatus{Step: 2, Message: "Открытие чат-канала (relay)..."}
 	streamCtx, streamCancel := context.WithTimeout(ctx, 10*time.Second)
-	if connType == "relay" {
-		streamCtx = network.WithAllowLimitedConn(streamCtx, "chat over relay")
-	}
+	streamCtx = network.WithAllowLimitedConn(streamCtx, "chat over relay")
 	stream, err := s.host.NewStream(streamCtx, info.ID, ChatProtocol)
 	streamCancel()
 	if err != nil {
@@ -231,7 +160,7 @@ func (s *Service) ConnectToPeer(ctx context.Context, info *peer.AddrInfo, status
 
 	go s.readLoop(stream, info.ID)
 
-	statusCh <- ConnectStatus{Step: 6, Message: fmt.Sprintf("Подключено (%s)", connType), Done: true}
+	statusCh <- ConnectStatus{Step: 2, Message: "Подключено (relay)", Done: true}
 	return nil
 }
 
