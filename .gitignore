@@ -8,10 +8,17 @@ server
 .vscode/
 *.swp
 *.swo
-
+.gocache/
+.gomodcache/
 # OS
 .DS_Store
 Thumbs.db
 
 # Go
 vendor/
+
+# Node / frontend
+node_modules/
+
+# Built UI (regenerate from web app)
+internal/clientapp/ui/dist/
